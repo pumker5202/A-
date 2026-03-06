@@ -1,33 +1,59 @@
-YOLOv11n vs YOLOv8n 비교 (Hailo + Raspberry Pi 5 기준, 2026년 최신 정보)
+# YOLOv11n vs YOLOv8n 비교 (Hailo + Raspberry Pi 5 기준, 2026년 기준)
 
-정확도 (mAP): YOLOv11n이 YOLOv8n보다 비슷하거나 약간 높음 (COCO 기준 mAP@50-95에서 0.5~2% 정도 우위, 졸음 감지처럼 미세 특징 잡을 때 유리).
-속도 (FPS): Hailo 환경에서 YOLOv11n이 더 빠르거나 비슷함.
+졸음운전 감지 프로젝트를 위한 **실시간 미세 특징 detection** (눈 감김, 하품 등) 최적 모델 선택 가이드  
+환경: Raspberry Pi 5 + Hailo-8L (13 TOPS) / Hailo-8 (26 TOPS) + Ubuntu 22.04 / Python 3.10
 
-  * Hailo-8L (13 TOPS): YOLOv8n 기준 200~400+ FPS (공식/커뮤니티 벤치, PCIe Gen3), YOLOv11n도 비슷하거나 약간 높음 (커뮤니티에서 YOLOv11n으로 300+ FPS 보고 사례 많음).
-  * Hailo-8 (26 TOPS): YOLOv8n ~300~500 FPS, YOLOv11n도 동등하거나 우수 (일부 테스트에서 YOLOv11n이 더 효율적).
-  * 실제 사용자 후기 (Hailo 커뮤니티, Degirum 등): YOLOv11n → YOLOv11s로 가도 FPS 유지하면서 정확도 ↑, YOLOv8n보다 "더 나은 효율" 언급 많음.
+## 1. 핵심 성능 비교 (COCO mAP & Hailo 실성능 기준)
 
-모델 크기 & 메모리: YOLOv11n이 파라미터 20~30% 적어 Hailo 컴파일 시 더 빠르고, 배터리/발열 덜 남.
-Hailo 지원성: 완벽 지원!
+| 항목                  | YOLOv8n                          | YOLOv11n                              | 승자 / 비고                                      |
+|-----------------------|----------------------------------|---------------------------------------|--------------------------------------------------|
+| **mAP@50-95 (COCO)**  | ~37.3–39.0                       | ~39.5 (Ultralytics 공식)              | **YOLOv11n** (+1~2%, 미세 클래스 더 잘 잡음)     |
+| **파라미터 수**       | ~3.15M                           | ~2.6–2.9M (약 20–22% 적음)            | **YOLOv11n** (가벼움 → 메모리/발열/컴파일 유리)   |
+| **FPS (Hailo-8L)**    | 150–250+ FPS                     | 비슷하거나 약간 ↑ (커뮤니티 200–300+ 보고) | **비슷 ~ YOLOv11n 약 우세** (효율성 개선)         |
+| **FPS (Hailo-8)**     | 250–450+ FPS                     | 비슷하거나 약간 우수                  | **비슷 ~ YOLOv11n 약 우세**                      |
+| **Hailo 지원성**      | Model Zoo .hef 기본 제공 많음     | 완벽 지원 (ONNX → .hef 잘 됨, 튜토리얼 활발) | 둘 다 좋음, YOLOv11n 최근 더 활발                |
+| **졸음감지 적합도**   | 안정적                           | **더 robust** (false positive ↓)      | **YOLOv11n 추천**                                |
 
-  * Ultralytics → ONNX export → Hailo Dataflow Compiler로 .hef 변환 잘 됨 (YOLOv11n 전용 튜토리얼/예제 GitHub 많음, 예: BetaUtopia/Hailo8l 레포 등).
-  * 2025년부터 Hailo 커뮤니티에서 YOLOv11n 커스텀 학습 + Pi 5 + picamera2 조합 가이드 활발.
-졸음운전 프로젝트에 왜 YOLOv11n이 더 좋을까?
+> 참고: Ultralytics 공식 비교 (docs.ultralytics.com)에서 YOLOv11n은 YOLOv8n 대비 mAP ↑ + 파라미터 ↓ + FLOPs ↓ 확인됨. Hailo 커뮤니티/포럼 후기 다수 "YOLOv11n이 더 효율적" 언급.
 
-눈 감김/하품 같은 미세 클래스 detection에서 YOLOv11n의 개선된 backbone이 더 robust (false positive ↓).
-실시간 알람 지연 최소화: FPS가 높을수록 프레임마다 체크 안정적 (30 FPS 이상이면 졸음 판단 로직 신뢰성 ↑).
-미래 지향적: Ultralytics가 YOLOv11을 메인으로 밀고 있어서 업데이트/커뮤니티 지원 더 좋음.
+## 2. 프로젝트 추천 순위 (졸음운전 감지 기준)
 
-추천 선택 순위 (Hailo + Pi 5 기준)
+| 순위 | 모델       | 추천 이유                                                                 | FPS 기대치 (Hailo-8L) | 언제 선택?                     |
+|------|------------|---------------------------------------------------------------------------|-------------------------|--------------------------------|
+| 1    | **YOLOv11n** | FPS 최상위권 + 정확도 ↑ + 가장 가벼움 → 졸음 미세 특징에 최적            | 200–300+ FPS            | **기본/최고 추천**             |
+| 2    | YOLOv8n    | Hailo Model Zoo에 .hef 미리 많음 → 초보자 입문/빠른 테스트 최고           | 150–250+ FPS            | fallback 또는 초보자용         |
+| 3    | YOLOv11s   | 정확도 더 필요 시 (FPS 20–35% ↓, 하지만 여전히 실시간 가능)               | 100–200+ FPS            | 정확도 최우선 시               |
 
-YOLOv11n → 가장 균형 좋음 (FPS 최고 + 정확도 ↑, 졸음 감지에 딱).
-YOLOv8n → Hailo Model Zoo에 기본 .hef 많아서 초보자 시작 쉬움 (fallback으로 좋음).
-YOLOv11s → 정확도 더 필요하면 (FPS 20~30% ↓ 하지만 여전히 100+ FPS 가능).
+## 3. 왜 졸음운전 프로젝트에 YOLOv11n이 더 좋을까? (TOP 3)
 
-실제로 시작할 때 팁
+1. **미세 특징 더 잘 잡음**  
+   눈 감김(closed_eyes), 하품(yawn) 같은 작은 클래스에서 backbone 개선 → false positive ↓, 신뢰도 ↑
 
-Ultralytics 최신 버전 설치: pip install ultralytics --upgrade
-모델 다운: yolo export model=yolo11n.pt format=onnx
-Hailo 컴파일: Dataflow Compiler (x86 PC/Colab)에서 calibration set 넣고 .hef 생성.
-Pi 5에서: hailort + picamera2로 inference (GitHub hailo-ai/hailo-rpi5-examples 예제 수정).
-졸음 로직: "closed_eyes" confidence > 0.7 & 10프레임 이상 지속 → buzzer/음성 알람.
+2. **실시간 지연 최소화**  
+   높은 FPS → 프레임마다 졸음 판단 안정적 (30 FPS 이상 유지 시 로직 신뢰성 크게 ↑)
+
+3. **미래 지향적**  
+   Ultralytics가 YOLOv11 시리즈 메인으로 밀고 있음 → 업데이트/커뮤니티 지원 빠름
+
+## 4. 실제 시작 플로우 (Ubuntu 22.04.5 + Python 3.10 기준)
+
+```bash
+# 1. 가상환경 & Ultralytics 설치 (PC 또는 Pi 모두)
+python3.10 -m venv yolo_env
+source yolo_env/bin/activate
+pip install --upgrade pip ultralytics
+
+# 2. ONNX export (PC 추천)
+yolo export model=yolo11n.pt format=onnx opset=12 dynamic=false simplify=true
+
+# 3. .hef 컴파일 (Hailo DFC, x86 PC/Colab)
+# Hailo Developer Zone → Dataflow Compiler 설치
+# calibration 이미지 100~500장 (졸음 관련 다양성 중요!)
+hailomz parse --hw-arch hailo8l yolo11n.onnx
+hailomz optimize yolo11n.har --calib-path /path/to/calib_images/
+
+# 4. Raspberry Pi 5 실행 준비
+sudo apt update && sudo apt install hailo-all python3-picamera2
+pip install hailort  # 또는 cp310 wheel 직접 설치
+git clone https://github.com/hailo-ai/hailo-rpi5-examples.git
+# detection 예제 수정 → .hef 로드 & 클래스: closed_eyes, yawn 등
