@@ -1,0 +1,16 @@
+https://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
+# 파일 다운로드 (wget이 없다면 브라우저로 직접 다운로드)
+wget https://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
+
+# bzip2로 압축 해제
+bzip2 -d shape_predictor_68_face_landmarks.dat.bz2
+pip install dlib opencv-python
+[  턱선: 0-16
+   오른쪽 눈썹: 17-21
+   왼쪽 눈썹: 22-26
+   코: 27-35
+   오른쪽 눈: 36-41
+   왼쪽 눈: 42-47
+   입: 48-67        ]
+
+pip install opencv-python dlib numpy
