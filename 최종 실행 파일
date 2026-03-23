@@ -1,0 +1,233 @@
+import cv2
+import dlib
+import numpy as np
+import time
+import threading
+from pathlib import Path
+
+try:
+    from flask import Flask, Response
+    HAS_FLASK = True
+except ImportError:
+    HAS_FLASK = False
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+MODEL_PATH = SCRIPT_DIR / "eye_classifier.rknn"
+LANDMARK_PATH = SCRIPT_DIR / "shape_predictor_68_face_landmarks.dat"
+
+# --- 설정값 ---
+EAR_THRESHOLD = 0.22      
+CNN_THRESHOLD = 0.45      
+MAR_THRESHOLD = 0.50      
+SLEEP_TIME_LIMIT = 10.0   
+RECOVERY_DURATION = 1.0   
+YAWN_DISPLAY_TIME = 3.0   
+BLINK_THRESHOLD = 0.3      
+WAKE_UP_THRESHOLD = 0.7    
+LEAVE_RESET_TIME = 3.0    
+
+WAIT_CENTER = np.array([320.0, 160.0]) 
+DRIVING_ZONE_RADIUS = 100               
+
+rknn, detector, predictor = None, None, None
+
+# 상태 변수 초기화
+eye_closed_start_time, eye_closed_duration, eye_open_start_time = 0, 0.0, 0
+normal_start_time, display_normal_time = 0, 0.0
+yawn_count, is_yawning_now, yawn_alert_start_time = 0, False, 0
+alert_active, is_currently_sleeping = False, False
+face_lost_start_time = 0  
+driver_seat_center = WAIT_CENTER.copy()
+start_init = False 
+
+last_frame_data = {
+    "ear": 1.0, "mar": 0.0, "box_color": (0, 255, 0), 
+    "l_eye": None, "r_eye": None, "m_pts": None, "box": None
+}
+last_cnn_pred = 1.0
+output_frame = None
+lock = threading.Lock()
+
+if HAS_FLASK: app = Flask(__name__)
+
+def load_rknn():
+    global rknn
+    try:
+        from rknnlite.api import RKNNLite
+        r = RKNNLite(); r.load_rknn(str(MODEL_PATH)); r.init_runtime(); rknn = r
+        return True
+    except: return False
+
+def reset_all_timers():
+    global eye_closed_start_time, eye_closed_duration, eye_open_start_time
+    global normal_start_time, display_normal_time, yawn_count, alert_active, is_currently_sleeping, start_init
+    eye_closed_start_time, eye_closed_duration, eye_open_start_time = 0, 0.0, 0
+    normal_start_time, display_normal_time = 0, 0.0
+    yawn_count, alert_active, is_currently_sleeping, start_init = 0, False, False, False
+
+def get_real_ear(pts):
+    v1, v2 = pts[5][1] - pts[1][1], pts[4][1] - pts[2][1]
+    h = np.linalg.norm(pts[0] - pts[3])
+    actual_height = (v1 + v2) / 2.0
+    return 0.12 if actual_height < 2.8 else actual_height / h
+
+def infer_eye_open_prob(roi):
+    if roi.size == 0 or rknn is None: return 1.0
+    img = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB), (64, 64)).astype(np.float32) / 255.0
+    img = (img - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
+    img = np.expand_dims(np.transpose(img, (2, 0, 1)), axis=0).astype(np.float32)
+    outs = rknn.inference(inputs=[img]); logits = np.asarray(outs[0]).reshape(-1)
+    return float(np.exp(logits[1]-np.max(logits)) / np.sum(np.exp(logits-np.max(logits))))
+
+def process_video():
+    global eye_closed_start_time, eye_closed_duration, eye_open_start_time, normal_start_time
+    global display_normal_time, alert_active, is_currently_sleeping, last_frame_data, last_cnn_pred
+    global driver_seat_center, output_frame, yawn_count, is_yawning_now, start_init, yawn_alert_start_time, face_lost_start_time
+
+    cap = None
+    for i in range(15):
+        c = cv2.VideoCapture(i); ok, _ = c.read()
+        if ok: cap = c; print(f"✅ 카메라 {i} 연결!"); break
+        c.release()
+    
+    if not cap: return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    last_loop_time = time.time()
+
+    while True:
+        ok, frame = cap.read()
+        if not ok: continue
+        curr_time = time.time()
+        fps = 1.0 / (curr_time - last_loop_time) if curr_time > last_loop_time else 0
+        last_loop_time = curr_time
+
+        frame = cv2.flip(frame, 1)
+        clean_frame, h, w = frame.copy(), frame.shape[0], frame.shape[1]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        gray_equalized = clahe.apply(gray)
+        faces = detector(gray_equalized, 0)
+        current_target = None
+
+        current_ear, current_mar = last_frame_data["ear"], last_frame_data["mar"]
+
+        if faces:
+            valid = [f for f in faces if np.linalg.norm(np.array([(f.left()+f.right())/2, (f.top()+f.bottom())/2]) - driver_seat_center) < DRIVING_ZONE_RADIUS]
+            if valid:
+                current_target = max(valid, key=lambda r: r.area())
+                driver_seat_center = 0.9 * driver_seat_center + 0.1 * np.array([(current_target.left()+current_target.right())/2, (current_target.top()+current_target.bottom())/2])
+                face_lost_start_time = 0 
+                if not start_init:
+                    normal_start_time = curr_time
+                    start_init = True
+
+        # --- [핵심] 상태 기억 기반 이탈 처리 ---
+        if not current_target and start_init:
+            if face_lost_start_time == 0: face_lost_start_time = curr_time
+            
+            # 1. 졸음 상황에서 고개를 숙여 얼굴이 안 보일 때 (졸음 경고 유지 및 시간 누적)
+            if alert_active or is_currently_sleeping or eye_closed_duration > BLINK_THRESHOLD:
+                if eye_closed_start_time == 0: eye_closed_start_time = curr_time - eye_closed_duration
+                eye_closed_duration = curr_time - eye_closed_start_time
+                normal_start_time, display_normal_time = 0, 0.0 # 고개 숙인 동안 OK 리셋
+            
+            # 2. 졸음이 아닌 정상 상태에서 3초 이상 이탈 시에만 초기화
+            elif curr_time - face_lost_start_time > LEAVE_RESET_TIME:
+                reset_all_timers()
+                driver_seat_center = WAIT_CENTER.copy()
+
+        box_color = (0, 255, 0)
+        if current_target:
+            lmarks = predictor(gray, current_target)
+            l_eye = np.array([(lmarks.part(n).x, lmarks.part(n).y) for n in range(36, 42)])
+            r_eye = np.array([(lmarks.part(n).x, lmarks.part(n).y) for n in range(42, 48)])
+            m_pts = np.array([(lmarks.part(n).x, lmarks.part(n).y) for n in range(48, 68)])
+            current_ear = (get_real_ear(l_eye) + get_real_ear(r_eye)) / 2.0
+            current_mar = (np.linalg.norm(m_pts[13]-m_pts[19]) + np.linalg.norm(m_pts[14]-m_pts[18]) + np.linalg.norm(m_pts[15]-m_pts[17])) / (3.0 * np.linalg.norm(m_pts[12]-m_pts[16]))
+
+            preds = [infer_eye_open_prob(clean_frame[max(0,int(np.min(pts[:,1])-7)):min(h,int(np.max(pts[:,1])+7)), max(0,int(np.min(pts[:,0])-7)):min(w,int(np.max(pts[:,0])+7))]) for pts in [l_eye, r_eye]]
+            if preds: last_cnn_pred = np.mean(preds)
+
+            is_eye_closed = (current_ear * (last_cnn_pred + 0.1) < 0.18) or (last_cnn_pred < CNN_THRESHOLD)
+
+            if is_eye_closed:
+                eye_open_start_time = 0
+                if eye_closed_start_time == 0: eye_closed_start_time = curr_time - eye_closed_duration
+                eye_closed_duration = curr_time - eye_closed_start_time
+                if eye_closed_duration > BLINK_THRESHOLD:
+                    normal_start_time, display_normal_time = 0, 0.0
+                    if eye_closed_duration > 0.6: is_currently_sleeping, box_color = True, (0, 0, 255)
+            else:
+                if is_currently_sleeping:
+                    if eye_open_start_time == 0: eye_open_start_time = curr_time
+                    if (curr_time - eye_open_start_time) > WAKE_UP_THRESHOLD:
+                        is_currently_sleeping, eye_closed_start_time, eye_closed_duration = False, 0, 0.0
+                else:
+                    eye_closed_start_time, eye_closed_duration = 0, 0.0
+                    if normal_start_time == 0: normal_start_time = curr_time
+                    display_normal_time = curr_time - normal_start_time
+                    # [핵심] 정상 상태가 연속 10초여야만 경고(alert_active) 해제
+                    if display_normal_time >= 10.0:
+                        alert_active = False
+
+            if current_mar > MAR_THRESHOLD and not is_currently_sleeping:
+                if not is_yawning_now: 
+                    yawn_count += 1; is_yawning_now = True
+                    if yawn_count >= 3: yawn_alert_start_time = curr_time
+            else: is_yawning_now = False
+
+            last_frame_data.update({"ear": current_ear, "mar": current_mar, "box_color": box_color, "l_eye": l_eye, "r_eye": r_eye, "m_pts": m_pts, "box": (current_target.left(), current_target.top(), current_target.right(), current_target.bottom())})
+
+        if eye_closed_duration >= SLEEP_TIME_LIMIT: alert_active = True
+        if yawn_count >= 3 and (curr_time - yawn_alert_start_time > YAWN_DISPLAY_TIME): yawn_count = 0
+
+        # UI 출력
+        cv2.rectangle(frame, (0, 0), (w, 65), (0, 0, 0), -1)
+        cv2.putText(frame, f"FPS:{fps:.1f} | CNN:{last_cnn_pred:.2f} | EAR:{current_ear:.2f} | MAR:{current_mar:.2f}", (15, 30), 1, 1.1, (255,255,255), 2)
+        cv2.putText(frame, f"CLOSE:{eye_closed_duration:.1f}s | YAWN:{yawn_count} | OK:{display_normal_time:.1f}s", (15, 55), 1, 1.1, (0, 255, 255), 2)
+
+        if alert_active: # 졸음 경고 출력 (고개 숙여도 유지됨)
+            cv2.rectangle(frame, (0, h-60), (w, h), (0, 0, 200), -1)
+            cv2.putText(frame, "!! EMERGENCY: SLEEP !!", (w//2-180, h-25), 1, 1.8, (255, 255, 255), 3)
+        elif not current_target and start_init: # 정상 상태에서 이탈 시 출력
+            cv2.rectangle(frame, (0, h-60), (w, h), (0, 150, 0), -1)
+            cv2.putText(frame, "!! DRIVER LEAVE !!", (w//2-140, h-25), 1, 1.8, (255, 255, 255), 3)
+        
+        if current_target:
+            bx = last_frame_data["box"]
+            cv2.rectangle(frame, (bx[0], bx[1]), (bx[2], bx[3]), box_color, 2)
+            cv2.rectangle(frame, (w-185, 70), (w-10, 340), (45, 45, 45), -1)
+            for i, pts in enumerate([last_frame_data["l_eye"], last_frame_data["r_eye"], last_frame_data["m_pts"]]):
+                if pts is None: continue
+                x1, y1, x2, y2 = np.min(pts[:,0]), np.min(pts[:,1]), np.max(pts[:,0]), np.max(pts[:,1])
+                roi_z = clean_frame[max(0,int(y1-10)):min(h,int(y2+10)), max(0,int(x1-10)):min(w,int(x2+10))].copy()
+                if roi_z.size > 0:
+                    for p in pts: cv2.circle(roi_z, (int(p[0]-(x1-10)), int(p[1]-(y1-10))), 1, (0,255,0) if i<2 else (0,255,255), -1)
+                    frame[80+(i*85):145+(i*85), w-165:w-55] = cv2.resize(roi_z, (110, 65))
+
+        if yawn_count >= 3:
+            cv2.rectangle(frame, (w//2-220, h//2-30), (w//2+220, h//2+30), (0, 165, 255), -1)
+            cv2.putText(frame, "PLEASE TAKE A BREAK!", (w//2-200, h//2+10), 1, 1.8, (255, 255, 255), 3)
+
+        cv2.circle(frame, (int(driver_seat_center[0]), int(driver_seat_center[1])), DRIVING_ZONE_RADIUS, (255, 255, 255), 1)
+        with lock: output_frame = frame.copy()
+
+def generate():
+    while True:
+        with lock:
+            if output_frame is None: continue
+            _, buf = cv2.imencode(".jpg", output_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+
+if HAS_FLASK:
+    @app.route("/video_feed")
+    def video_feed(): return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    @app.route("/")
+    def index(): 
+        return "<html><body style='background:#000;margin:0;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden;'><img src='/video_feed' style='width:98vw;height:95vh;object-fit:contain;'></body></html>"
+
+if __name__ == "__main__":
+    if load_rknn():
+        detector = dlib.get_frontal_face_detector(); predictor = dlib.shape_predictor(str(LANDMARK_PATH))
+        threading.Thread(target=process_video, daemon=True).start()
+        if HAS_FLASK: app.run(host="0.0.0.0", port=5000, threaded=True)
