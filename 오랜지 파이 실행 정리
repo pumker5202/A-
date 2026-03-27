@@ -131,3 +131,115 @@ Score=EAR×(CNNprob​+0.1)
 
     하드웨어 최적화: Keras → ONNX → RKNN 공정을 통한 실시간성(30 FPS) 달성.
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# 졸음 감지 모델 RKNN 변환 보고서
+
+## 1. 개요
+
+졸음 운전 감지 시스템(DMS)의 눈 감음 판별 CNN 모델(`drowsy_multimodal_v6`)을 RK3588 NPU에서 동작하도록 **Keras(.h5) → ONNX → RKNN** 2단계 변환을 수행하였다.
+
+---
+
+## 2. 모델 사양
+
+| 항목 | 내용 |
+|------|------|
+| **원본 형식** | Keras SavedModel (.h5) |
+| **입력** | 224×224×3 RGB, float32, 0~1 정규화 |
+| **출력** | 스칼라 (눈 뜬 확률, 1.0=뜸, 0에 가까움=감음) |
+| **타겟 플랫폼** | RK3588 (Rockchip NPU) |
+
+---
+
+## 3. 변환 파이프라인
+
+```
+drowsy_multimodal_v6_retry.h5  →  drowsy_v6.onnx  →  drowsy_v6.rknn
+        (Keras)                    (중간 표준)          (NPU 배포)
+```
+
+### 3-1. 1단계: Keras → ONNX
+
+- **도구**: tf2onnx
+- **환경**: Keras 3.x + TensorFlow 2.19 (env-export 가상환경)
+- **이유**: 원본 .h5가 Keras 3.12 형식으로 저장되어 있어, Keras 3 호환 환경에서만 로드 가능
+
+**주요 코드:**
+```python
+model = keras.models.load_model(H5_MODEL_PATH, compile=False)
+tf2onnx.convert.from_keras(
+    model,
+    input_signature=(tf.TensorSpec((1, 224, 224, 3), tf.float32, name="input"),),
+    opset=13,
+    output_path=ONNX_MODEL_PATH,
+)
+```
+
+**출력**: `drowsy_v6.onnx` (약 10MB)
+
+---
+
+### 3-2. 2단계: ONNX → RKNN
+
+- **도구**: rknn-toolkit2 (v2.3.2)
+- **환경**: env-rknn 가상환경
+
+**변환 설정:**
+| 설정 | 값 | 설명 |
+|------|-----|------|
+| target_platform | rk3588 | 타겟 보드 지정 |
+| mean_values | None | 전처리 미적용 (학습 시 /255 이미 적용) |
+| std_values | None | 전처리 미적용 |
+| do_quantization | False | FP32 유지 (양자화 생략) |
+
+**처리 흐름:**
+1. `load_onnx()` — ONNX 모델 로드
+2. `build()` — RK3588 NPU용 그래프 최적화 및 빌드
+3. `export_rknn()` — .rknn 파일 저장
+
+**출력**: `drowsy_v6.rknn` (약 5.8MB)
+
+---
+
+## 4. 배포 환경
+
+### 4-1. 보드 측 (RK3588)
+
+- **런타임**: rknn-toolkit-lite2 (rknnlite)
+- **필수 파일**: drowsy_v6.rknn, run_v6_webcam_rknn.py, shape_predictor_68_face_landmarks.dat
+- **의존성**: opencv-python, numpy, dlib, rknn-toolkit-lite2
+
+### 4-2. 추론 시 전처리
+
+- 웹캠에서 dlib로 얼굴/눈 영역 검출 → 눈 ROI 추출
+- ROI를 224×224로 리사이즈 후 `/255.0` 정규화 (float32)
+- RKNN 추론 결과(눈 뜬 확률)를 EAR 및 MAR과 함께 졸음 판정에 활용
+
+---
+
+## 5. 사용 도구 요약
+
+| 단계 | 도구 | 버전 |
+|------|------|------|
+| Keras 로드 | keras | 3.12.1 |
+| ONNX 변환 | tf2onnx | - |
+| RKNN 변환 | rknn-toolkit2 | 2.3.2 |
+| 보드 추론 | rknn-toolkit-lite2 | 2.3.2 |
+
+---
+
+## 6. 산출물
+
+| 파일 | 용도 |
+|------|------|
+| drowsy_v6.onnx | ONNX 중간 모델 |
+| drowsy_v6.rknn | RK3588 NPU 배포용 최종 모델 |
+| run_v6_webcam_rknn.py | 웹캠 기반 실시간 추론 스크립트 |
+| drowsy_v6_board.tar.gz | 보드 배포용 압축 패키지 |
+
+---
+
+## 7. 참고 사항
+
+- **양자화**: 현재 FP32로 변환. INT8 양자화 적용 시 모델 크기 및 추론 속도 추가 개선 가능.
+- **전처리 내장**: RKNN config의 mean_values, std_values를 이용하면 전처리를 NPU 내부로 이전할 수 있음.
+- **학습**: RKNN은 추론 전용이며, 모델 학습은 TensorFlow/Keras 등에서 수행 후 변환하는 방식으로 진행됨.
