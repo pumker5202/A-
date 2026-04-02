@@ -1,70 +1,46 @@
 import cv2
-import dlib
-import numpy as np
-import csv
-from ultralytics import YOLO
-from scipy.spatial import distance as dist
+import os
+import time
 
-def calculate_ear(eye):
-    A = dist.euclidean(eye[1], eye[5]); B = dist.euclidean(eye[2], eye[4])
-    C = dist.euclidean(eye[0], eye[3])
-    return (A + B) / (2.0 * C)
+# 1. 저장할 폴더 생성
+base_dir = "local_dataset"
+classes = ['bottle', 'human']
+for cls in classes:
+    os.makedirs(f"{base_dir}/{cls}", exist_ok=True)
 
-def calculate_mar(mouth):
-    A = dist.euclidean(mouth[14], mouth[18]); B = dist.euclidean(mouth[13], mouth[19])
-    C = dist.euclidean(mouth[12], mouth[16])
-    return (A + B) / (2.0 * C)
-
-model = YOLO("runs/detect/pure_eye_mouth_model/weights/best.pt")
-predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
-
-f = open('drowsy_data.csv', 'a', encoding='utf-8', newline='')
-wr = csv.writer(f)
-
+# 2. 웹캠 시작
 cap = cv2.VideoCapture(0)
-print("--- 데이터 수집 중 (눈 박스 무관 감지) ---")
+
+print("📸 선우님, 데이터 수집을 시작합니다!")
+print("'h'를 누르면 Human, 'b'를 누르면 Bottle 폴더에 저장됩니다. 'q'는 종료.")
+
+count = {'human': 0, 'bottle': 0}
 
 while True:
     ret, frame = cap.read()
     if not ret: break
     
-    results = model(frame, conf=0.5, verbose=False)
-    key = cv2.waitKey(30) & 0xFF
-    label = -1
-    if key == ord('1'): label = 0
-    elif key == ord('2'): label = 1
-    elif key == ord('q'): break
-
-    # r.plot() 결과물을 먼저 복사
-    display_frame = frame.copy()
-
-    for r in results:
-        display_frame = r.plot() # YOLO 박스(Face 등) 그리기
+    cv2.imshow('Collect Data - Sunwoo', frame)
+    key = cv2.waitKey(1) & 0xFF
+    
+    # 'h' 누르면 사람 사진 저장
+    if key == ord('h'):
+        count['human'] += 1
+        filename = f"{base_dir}/human/human_{count['human']}_{int(time.time())}.jpg"
+        cv2.imwrite(filename, frame)
+        print(f"✅ Human 사진 저장 완료! (총 {count['human']}장)")
         
-        for box in r.boxes:
-            # 핵심: 눈 박스가 사라져도 'Face(0번)' 박스만 있으면 dlib 실행!
-            if int(box.cls[0]) == 0: 
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                
-                # 얼굴 전체 영역을 dlib 사각형으로 변환
-                dlib_rect = dlib.rectangle(x1, y1, x2, y2)
-                landmarks = predictor(frame, dlib_rect)
-                pts = np.array([[p.x, p.y] for p in landmarks.parts()])
+    # 'b' 누르면 병 사진 저장
+    elif key == ord('b'):
+        count['bottle'] += 1
+        filename = f"{base_dir}/bottle/bottle_{count['bottle']}_{int(time.time())}.jpg"
+        cv2.imwrite(filename, frame)
+        print(f"✅ Bottle 사진 저장 완료! (총 {count['bottle']}장)")
+        
+    elif key == ord('q'):
+        break
 
-                # dlib은 얼굴 박스 내에서 눈 감음을 수치로 계산함
-                ear = (calculate_ear(pts[36:42]) + calculate_ear(pts[42:48])) / 2.0
-                mar = calculate_mar(pts[48:68])
-
-                # 초록색 포인트 가시화 (이제 눈을 감아도 점들이 보일 겁니다)
-                for (px, py) in pts:
-                    cv2.circle(display_frame, (px, py), 1, (0, 255, 0), -1)
-
-                if label != -1:
-                    wr.writerow([ear, mar, label])
-                    cv2.putText(display_frame, f"SAVED: {label}", (x1, y1-10), 1, 1.5, (0, 255, 0), 2)
-
-                cv2.putText(display_frame, f"EAR: {ear:.2f} MAR: {mar:.2f}", (20, 40), 1, 0.7, (255, 255, 255), 2)
-
-    cv2.imshow("Data Collector", display_frame)
-
-cap.release(); f.close(); cv2.destroyAllWindows()
+cap.release()
+cv2.destroyAllWindows()
+print(f"✨ 수집 완료! Human: {count['human']}장, Bottle: {count['bottle']}장")
+print(f"📁 사진은 'local_dataset' 폴더에 저장되었습니다.")
